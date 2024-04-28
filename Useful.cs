@@ -4,6 +4,9 @@ using System.Collections.Generic;
 using UnityEngine;
 using System.Linq;
 using System.Threading.Tasks;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Burst;
 
 namespace Tallow
 {
@@ -18,7 +21,7 @@ namespace Tallow
             return (f * percent) * 0.01f;
         }
 
-        public static Vector3 DirTo<T,O>(this T firstThing, O otherThing) where T : Component where O : Component
+        public static Vector3 DirTo<T, O>(this T firstThing, O otherThing) where T : Component where O : Component
         {
             // Calculate the direction to the player
             return (otherThing.transform.position - firstThing.transform.position).normalized;
@@ -30,23 +33,47 @@ namespace Tallow
             return (otherThing - firstThing).normalized;
         }
 
+        public struct CenterOfVectorsJob : IJob
+        {
+            [ReadOnly] public NativeArray<Vector3> points;
+            public Vector3 center;
+
+            public void Execute()
+            {
+                // If there's only one point, set it as the center
+                if (points.Length == 1)
+                {
+                    center = points[0];
+                    return;
+                }
+
+                // Sum all points
+                for (int i = 0; i < points.Length; i++)
+                {
+                    center += points[i];
+                }
+
+                // Divide by the number of points to get the average
+                center /= points.Length;
+            }
+        }
         public static Vector3 CalculateCenter(this List<Vector3> points)
         {
-            //If there is only one item in the list of Vectors, give it back as the center.
-            if (points.Count == 1) return points[0];
+            NativeArray<Vector3> nativePoints = new NativeArray<Vector3>(points.ToArray(), Allocator.TempJob);
+            Vector3 centerReport = Vector3.zero;
 
-            Vector3 center = Vector3.zero;
-
-            // Sum all points
-            foreach (Vector3 point in points)
+            CenterOfVectorsJob centerJob = new CenterOfVectorsJob
             {
-                center += point;
-            }
+                points = nativePoints,
+                center = centerReport
+            };
 
-            // Divide by the number of points to get the average
-            center /= points.Count;
+            JobHandle handle = centerJob.Schedule();
+            handle.Complete();
 
-            return center;
+            nativePoints.Dispose();
+
+            return centerReport;
         }
 
         public static bool InRange(this float f, float min, float max)
@@ -68,6 +95,47 @@ namespace Tallow
             }
 
             return true;
+        }
+
+        //Checks if the component has anything between it and something else.
+        public static bool CanSee<T, O>(this T thisThing, O otherThing) where T : Component where O : Component
+        {
+            Vector3 tfPos = thisThing.transform.position;
+
+            //If we hit something that wasn't what we were aiming for, then return true to the view being blocked.
+            if (Physics.Raycast(tfPos, tfPos.DirTo(otherThing.transform.position), out RaycastHit hit)
+                && hit.collider.gameObject != otherThing)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        public static bool CanSeeFullscan<T, O>(this T thisThing, O otherThing) where T : Component where O : Component
+        {
+            // Calculate direction to the target
+            Vector3 direction = thisThing.DirTo(otherThing);
+
+            // Perform raycast to check for obstacles
+            RaycastHit hit;
+
+            if (Physics.Raycast(thisThing.transform.position, direction, out hit, Mathf.Infinity))
+            {
+                if (hit.transform.root.gameObject == otherThing.gameObject) return true; 
+
+                // Check over each of the gameObjects within the 
+                foreach (Transform t in hit.transform.root)
+                {
+                    // If an obstacle is hit, the target is not visible
+                    if (t.gameObject == otherThing.gameObject)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false; // View is blocked or no hits
         }
 
         public static bool CanSeeFullscan<T, O>(this T thisThing, O otherThing, LayerMask obstacleMask) where T : Component where O : Component
@@ -109,29 +177,62 @@ namespace Tallow
             return hits;
         }
 
+        public struct DistanceJob : IJob
+        {
+            public Vector3 positionA;
+            public Vector3 positionB;
+            public NativeArray<float> result;
+
+            public void Execute()
+            {
+                result[0] = Vector3.Distance(positionA, positionB);
+            }
+        }
+        public static float DistAsync(Vector3 positionA, Vector3 positionB)
+        {
+            // Create NativeArray to store result
+            NativeArray<float> result = new NativeArray<float>(1, Allocator.TempJob);
+
+            DistanceJob distanceJob = new DistanceJob
+            {
+                positionA = positionA,
+                positionB = positionB,
+                result = result
+            };
+
+            JobHandle handle = distanceJob.Schedule();
+            handle.Complete();
+
+            float distance = result[0];
+
+            result.Dispose();
+
+            return distance;
+        }
+
         public static float DistTo<T, O>(this T to, O distToThis) where T : Component where O : Component
         {
-            return Vector3.Distance(to.transform.position, distToThis.transform.position);
+            return DistAsync(to.transform.position, distToThis.transform.position);
         }
 
         public static float DistTo<T>(this T to, Vector3 distToThis) where T : Component
         {
-            return Vector3.Distance(to.transform.position, distToThis);
+            return DistAsync(to.transform.position, distToThis);
         }
 
         public static float DistTo(this Vector3 to, Vector3 distToThis)
         {
-            return Vector3.Distance(to, distToThis);
+            return DistAsync(to, distToThis);
         }
 
         public static void SafeAdd<T>(this List<T> toThis, T addThis)
         {
-            if (!toThis.Contains(addThis)) toThis.Add(addThis);
+            if (!toThis.HasThis(addThis)) toThis.Add(addThis);
         }
 
         public static void SafeRemove<T>(this List<T> fromThis, T removeThis)
         {
-            if (fromThis.Contains(removeThis)) fromThis.Remove(removeThis);
+            if (fromThis.HasThis(removeThis)) fromThis.Remove(removeThis);
         }
 
         public static Dictionary<TKey, TValue> Sort<TKey, TValue>(this Dictionary<TKey, TValue> dictionary)
@@ -139,9 +240,57 @@ namespace Tallow
             return dictionary.OrderBy(x => x.Value).ToDictionary(pair => pair.Key, pair => pair.Value);
         }
 
+        public static Dictionary<TKey, TValue> SortByLargest<TKey, TValue>(this Dictionary<TKey, TValue> dictionary)
+        {
+            return dictionary.OrderByDescending(x => x.Value).ToDictionary(pair => pair.Key, pair => pair.Value);
+        }
+
+        public static List<T> GetThingsInCone<T>(this Transform thisThing, List<T> these, float coneAngle) where T : Component
+        {
+            List<T> those = new List<T>();
+
+            foreach (T t in these)
+            {
+                if (thisThing.InCone(t, coneAngle)) those.Add(t);
+            }
+            return those;
+        }
+
+        public static bool InCone<T, O>(this T thisThing, O otherThing, float coneAngle) where T : Component where O : Component
+        {
+            float angle = thisThing.transform.forward.AngleTo(thisThing.DirTo(otherThing));
+
+            if (angle < coneAngle) return true;
+            return false;
+        }
+
         public static bool Empty<T>(this List<T> list)
         {
             if (list.Count == 0) return true;
+            return false;
+        }
+
+        public static bool TryGetComponentFullscan<T>(this Component go, out T comp) where T : Component
+        {
+            T t = go.GetComponent<T>();
+
+            if (t)
+            {
+                comp = t;
+                return true;
+            }
+            else
+            {
+                t = go.transform.root.GetComponentInChildren<T>();
+
+                if (t)
+                {
+                    comp = t;
+                    return true;
+                }
+            }
+
+            comp = t;
             return false;
         }
 
@@ -307,26 +456,23 @@ namespace Tallow
             return false;
         }
 
-        public static T AddOrGet<T>(this GameObject go) where T : Component
+        public static int RandRange(int first, int second)
         {
-            if (go.TryGetComponent<T>(out T component))
-                return component;
-            else return go.AddComponent<T>();
+            return UnityEngine.Random.Range(first, second);
         }
-
         public static float RandRange(float first, float second)
         {
             return UnityEngine.Random.Range(first, second);
         }
-        public static int RandRange(int first, int second)
+        public static double RandRange(double first, double second)
         {
-            return UnityEngine.Random.Range(first, second);
+            return (double)UnityEngine.Random.Range((float)first, (float)second);
         }
 
         public static IEnumerator DestroyAfter<T>(this T wipeThis, float afterThisTime) where T : Component
         {
             //Wait until the timer has depleted entirely before continuing.
-            while (afterThisTime > 0 && wipeThis)
+            while (afterThisTime > 0)
             {
                 afterThisTime -= Time.deltaTime;
                 yield return null;
@@ -338,7 +484,7 @@ namespace Tallow
         public static IEnumerator DestroyAfter(this GameObject wipeThis, float afterThisTime)
         {
             //Wait until the timer has depleted entirely before continuing.
-            while (afterThisTime > 0 && wipeThis)
+            while (afterThisTime > 0)
             {
                 afterThisTime -= Time.deltaTime;
                 yield return null;
@@ -353,7 +499,7 @@ namespace Tallow
 
             //Wait until the timer has depleted entirely before continuing.
             //Also, check to make sure the fromThis transform still exists and hasn't been destroyed. If it has, exit this routine and log an error.
-            while (dist < afterThisDist && wipeThis)
+            while (dist < afterThisDist)
             {
                 dist = wipeThis.DistTo(fromThis);
                 yield return null;
@@ -407,57 +553,140 @@ namespace Tallow
             }
             return false;
         }
-        public static GameObject GetClosest(this Vector3 closestTo, List<GameObject> LGO)
+        public struct ClosestObjectJob<T> : IJobParallelFor where T : Component
         {
-            Dictionary<GameObject, float> DistOfGameObjs = new Dictionary<GameObject, float>();
+            [ReadOnly] public NativeArray<Vector3> positions;
+            public Vector3 closestTo;
+            public NativeArray<float> distances;
+            public NativeArray<int> closestIndices;
 
-            foreach (GameObject GO in LGO)
+            public void Execute(int index)
             {
-                DistOfGameObjs.Add(GO, Vector3.Distance(closestTo, GO.transform.position));
+                distances[index] = positions[index].DistTo(closestTo);
+            }
+        }
+        public static T GetClosest<T>(this Vector3 closestTo, List<T> components) where T : Component
+        {
+            int count = components.Count;
+            if (count == 0) return null;
+
+            NativeArray<Vector3> positions = new NativeArray<Vector3>(count, Allocator.TempJob);
+            NativeArray<float> distances = new NativeArray<float>(count, Allocator.TempJob);
+            NativeArray<int> closestIndices = new NativeArray<int>(1, Allocator.TempJob);
+
+            // Copy positions to NativeArray
+            for (int i = 0; i < count; i++)
+            {
+                positions[i] = components[i].transform.position;
             }
 
-            // Sort the dictionary by value of distance, then return the first of these values.
-            return DistOfGameObjs.OrderBy(x => x.Value).ToDictionary(pair => pair.Key, pair => pair.Value).Keys.First();
+            // Schedule job to compute distances in parallel
+            ClosestObjectJob<T> job = new ClosestObjectJob<T>
+            {
+                positions = positions,
+                closestTo = closestTo,
+                distances = distances,
+                closestIndices = closestIndices
+            };
+            JobHandle handle = job.Schedule(count, 64);
+
+            // Wait for job to complete
+            handle.Complete();
+
+            // Find the closest object
+            float minDist = float.MaxValue;
+            int closestIndex = -1;
+            for (int i = 0; i < count; i++)
+            {
+                float dist = distances[i];
+                if (dist < minDist)
+                {
+                    minDist = dist;
+                    closestIndex = i;
+                }
+            }
+
+            // Cleanup
+            positions.Dispose();
+            distances.Dispose();
+            closestIndices.Dispose();
+
+            if (closestIndex >= 0)
+            {
+                return components[closestIndex];
+            }
+            else
+            {
+                return null;
+            }
         }
 
+        public struct AngleJob : IJob
+        {
+            public Vector3 from;
+            public Vector3 to;
+            public NativeArray<float> result;
+
+            public void Execute()
+            {
+                float num = Mathf.Sqrt(from.sqrMagnitude * to.sqrMagnitude);
+                if (num < 1E-15f)
+                {
+                    result[0] = 0f;
+                    return;
+                }
+
+                float num2 = Mathf.Clamp(Vector3.Dot(from, to) / num, -1f, 1f);
+                result[0] = Mathf.Acos(num2) * Mathf.Rad2Deg;
+            }
+        }
+
+        public static float AngleToAsync(this Vector3 from, Vector3 to)
+        {
+            NativeArray<float> result = new NativeArray<float>(1, Allocator.TempJob);
+
+            AngleJob angleJob = new AngleJob
+            {
+                from = from,
+                to = to,
+                result = result
+            };
+
+            JobHandle handle = angleJob.Schedule();
+            handle.Complete();
+
+            float angle = result[0];
+
+            result.Dispose();
+
+            return Mathf.Abs(angle);
+        }
+        
         public static float AngleTo(this Vector3 thing, Vector3 otherThing)
         {
             return Mathf.Abs(Vector3.Angle(thing, otherThing));
         }
 
+        // Function to calculate angle between two 2D vectors
+        public static float AngleTo(Vector2 a, Vector2 b)
+        {
+            // Calculate dot product
+            float dotProduct = Vector2.Dot(a.normalized, b.normalized);
+
+            // Calculate angle in radians, then convert to Degrees.
+            float angle = Mathf.Acos(dotProduct) * Mathf.Rad2Deg;
+
+            return Mathf.Abs(angle);
+        }
+
         /// <summary>
-        /// Returns the closest component, by distance, to the conponent specified fron the list specified.
+        /// Returns the closest component, by distance, to the component specified fron the list specified.
         /// </summary>
         /// <typeparam name="T"></typeparam>
         /// <typeparam name="O"></typeparam>
         /// <param name="LGO"></param>
         /// <param name="closestTo"></param>
         /// <returns></returns>
-        public static T ClosestTo<T, O>(this List<T> LGO, O closestTo) where T : Component where O : Component
-        {
-            Dictionary<T, float> DistOfGameObjs = new Dictionary<T, float>();
-
-            foreach (T GO in LGO)
-            {
-                DistOfGameObjs.Add(GO, UnityEngine.Vector3.Distance(closestTo.transform.position, GO.transform.position));
-            }
-
-            // Sort the dictionary by value of distance, then return the first of these values.
-            return DistOfGameObjs.OrderBy(x => x.Value).ToDictionary(pair => pair.Key, pair => pair.Value).Keys.ToList().First();
-        }
-
-        public static T ClosestTo<T>(this List<T> LGO, Vector3 closestTo) where T : Component
-        {
-            Dictionary<T, float> DistOfGameObjs = new Dictionary<T, float>();
-
-            foreach (T GO in LGO)
-            {
-                DistOfGameObjs.Add(GO, Vector3.Distance(closestTo, GO.transform.position));
-            }
-
-            // Sort the dictionary by value of distance, then return the first of these values.
-            return DistOfGameObjs.OrderBy(x => x.Value).ToDictionary(pair => pair.Key, pair => pair.Value).Keys.ToList().First();
-        }
 
         public static void TurnTowards<T, O>(this T thingToRotate, O turnTowards, float rotationSpeed) where T : Component where O : Component
         {
@@ -605,6 +834,12 @@ namespace Tallow
 
     public static class ListWorks
     {
+        public static bool HasThis<T>(this List<T> list, T thing)
+        {
+            if (list.IndexOf(thing) != -1) return true;
+            return false;
+        }
+
         // Define a custom comparer for components
         public class ComponentComparer<T> : IComparer<T> where T : Component
         {
@@ -648,7 +883,7 @@ namespace Tallow
             // Calculate distances from 'closestTo' for each item in the list
             foreach (T item in list)
             {
-                distances.Add(item, UnityEngine.Vector3.Distance(getPosition(closestTo), getPosition(item)));
+                distances.Add(item, getPosition(closestTo).DistTo(getPosition(item)));
             }
 
             // Sort the dictionary by distance and return the sorted keys
@@ -661,11 +896,72 @@ namespace Tallow
 
             foreach (T GO in LGO)
             {
-                DistOfGameObjs.Add(GO, Vector3.Distance(closestTo, GO.transform.position));
+                DistOfGameObjs.Add(GO, closestTo.DistTo(GO.transform.position));
             }
 
             // Sort the dictionary by value of distance, then return the first of these values.
             return DistOfGameObjs.OrderBy(x => x.Value).ToDictionary(pair => pair.Key, pair => pair.Value).Keys.ToList();
+        }
+
+        public static List<Vector3> SortByDistance(this Vector3 closestTo, List<Vector3> LGO)
+        {
+            Dictionary<Vector3, float> DistOfGameObjs = new Dictionary<Vector3, float>();
+
+            foreach (Vector3 GO in LGO)
+            {
+                DistOfGameObjs.Add(GO, closestTo.DistTo(GO));
+            }
+
+            // Sort the dictionary by value of distance, then return the first of these values.
+            return DistOfGameObjs.OrderBy(x => x.Value).ToDictionary(pair => pair.Key, pair => pair.Value).Keys.ToList();
+        }
+        public struct DistanceCalculationJob<T> : IJobParallelFor where T : Component
+        {
+            [ReadOnly] public NativeArray<Vector3> positions;
+            public Vector3 point;
+            public NativeArray<float> distances;
+
+            public void Execute(int index)
+            {
+                distances[index] = Vector3.Distance(positions[index], point);
+            }
+        }
+        public static List<T> SortByDistance<T>(this List<T> components, Vector3 point) where T : Component
+        {
+            int count = components.Count;
+            if (count == 0) return components;
+
+            NativeArray<Vector3> positions = new NativeArray<Vector3>(count, Allocator.TempJob);
+            NativeArray<float> distances = new NativeArray<float>(count, Allocator.TempJob);
+
+            // Copy positions to NativeArray
+            for (int i = 0; i < count; i++)
+            {
+                positions[i] = components[i].transform.position;
+            }
+
+            // Schedule job to compute distances in parallel
+            DistanceCalculationJob<T> job = new DistanceCalculationJob<T>
+            {
+                positions = positions,
+                point = point,
+                distances = distances
+            };
+            JobHandle handle = job.Schedule(count, 64);
+
+            // Wait for job to complete
+            handle.Complete();
+
+            // Create a copy of the original list
+            List<T> sortedComponents = new List<T>(components);
+
+            sortedComponents.ToArray().SortAsync(distances.ToArray());
+
+            // Cleanup
+            positions.Dispose();
+            distances.Dispose();
+
+            return sortedComponents;
         }
         public static List<T> SiftForType<T>(List<UnityEngine.Object> objectList) where T : UnityEngine.Object
         {
@@ -692,10 +988,7 @@ namespace Tallow
                 {
                     rL.Add(list[i]);
                 }
-                else
-                {
-                    break; // Exit the loop if we reached the end of the input list
-                }
+                else break; // Exit the loop if we reached the end of the input list
             }
 
             return rL;
@@ -872,81 +1165,241 @@ namespace Tallow
             return Mathf.Sqrt((initialIntensity * reflectivity) / desiredIntensity);
         }
 
-        public static List<RadReturn> DopplerFilter(this List<RadReturn> rList, Rigidbody thisRB, float dMin, float dMax)
+        public static List<RadReturn> SortByDoppler(this List<RadReturn> rList, Rigidbody thisRB, float dMin, float dMax)
         {
-            Dictionary<RadReturn, float> RadRets = new Dictionary<RadReturn, float>();
+            int count = rList.Count;
 
-            foreach (RadReturn RR in rList)
+            // Initialize result array with enough capacity
+            NativeArray<float> result = new NativeArray<float>(count * 64, Allocator.TempJob);
+
+            Vector3 thisVel = thisRB.velocity;
+            Vector3 thisPos = thisRB.transform.position;
+
+            for (int i = 0; i < count; i++)
             {
-                if (RR.TryGetComponent<Rigidbody>(out Rigidbody otherRB))
-                {
-                    float doppler = DopplerValue(thisRB, otherRB);
+                Vector3 otherVel = rList[i].rigidBody.velocity;
+                Vector3 otherPos = rList[i].transform.position;
 
-                    if (!doppler.InRange(dMin, dMax))
-                    {
-                        RadRets.Add(RR, doppler);
-                        //Debug.Log(RR + " was added with doppler value " + doppler + " between " + dMin + " and " + dMax);
-                    }
-                }
+                DopplerJob dopplerJob = new DopplerJob
+                {
+                    thisRBVel = thisVel,
+                    otherRBVel = otherVel,
+                    thisPos = thisPos,
+                    otherPos = otherPos,
+                    minDop = dMin,
+                    maxDop = dMax,
+
+                    // Pass the correct offset into the result array for each job
+                    result = result.GetSubArray(i * 64, 64)
+                };
+
+                JobHandle handle = dopplerJob.Schedule(); // Schedule one job at a time
+                handle.Complete();
             }
 
-            // Return the keys (RadReturn objects) in the sorted dictionary as a list, from the greatest DopplerValues to the smallest (which are likely to be chaff).
-            return RadRets.OrderByDescending(kv => kv.Value).ToDictionary(pair => pair.Key, pair => pair.Value).Keys.ToList();
-        }
+            // Create a copy of the original list
+            List<RadReturn> sortedComponents = new List<RadReturn>(rList);
 
-        public static float DopplerValue(Rigidbody thisThing, Rigidbody otherThing)
+            sortedComponents.ToArray().SortDescendingAsync(result.ToArray());
+
+            result.Dispose();
+
+            return sortedComponents;
+        }
+        /// <summary>
+        /// Sorts one list based on values provided by another.
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="sortedComponents"></param>
+        /// <param name="result"></param>
+        public static async void SortAsync<T>(this T[] sortedComponents, float[] result) where T : Component
         {
-            Vector3 thisRBVel = Vector3.zero;
-            Vector3 otherRBVel = Vector3.zero;
-
-            if (thisThing) thisRBVel = thisThing.velocity;
-            if (otherThing) otherRBVel = otherThing.velocity;
-
-            // Calculate the relative velocity between the radar return and the object
-            Vector3 relativeVelocity = otherRBVel - thisRBVel;
-
-            // Calculate the Doppler effect based on the relative velocity
-            return Vector3.Dot(relativeVelocity, (thisThing.position - otherThing.position).normalized);
+            await Task.Run(() =>
+            {
+                int count = Mathf.Min(result.Length, sortedComponents.Length); // Ensure count doesn't exceed array lengths
+                                                                               // Sort the list based on bearings
+                for (int i = 0; i < count - 1; i++)
+                {
+                    for (int j = i + 1; j < count; j++)
+                    {
+                        if (j < result.Length && j < sortedComponents.Length) // Check bounds
+                        {
+                            if (result[i] < result[j])
+                            {
+                                // Swap elements using tuple
+                                (sortedComponents[i], sortedComponents[j]) = (sortedComponents[j], sortedComponents[i]);
+                                (result[i], result[j]) = (result[j], result[i]);
+                            }
+                        }
+                    }
+                }
+            });
         }
+
+        public static async void SortDescendingAsync<T>(this T[] sortedComponents, float[] result) where T : Component
+        {
+            await Task.Run(() =>
+            {
+                int count = Mathf.Min(result.Length, sortedComponents.Length); // Ensure count doesn't exceed array lengths
+                                                                               // Sort the list based on bearings
+                for (int i = 0; i < count - 1; i++)
+                {
+                    for (int j = i + 1; j < count; j++)
+                    {
+                        if (j < result.Length && j < sortedComponents.Length) // Check bounds
+                        {
+                            if (result[i] > result[j])
+                            {
+                                // Swap elements using tuple
+                                (sortedComponents[i], sortedComponents[j]) = (sortedComponents[j], sortedComponents[i]);
+                                (result[i], result[j]) = (result[j], result[i]);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        public struct DopplerJob : IJob
+        {
+            public Vector3 thisRBVel;
+            public Vector3 thisPos;
+            public Vector3 otherRBVel;
+            public Vector3 otherPos;
+            public NativeArray<float> result;
+            public float minDop;
+            public float maxDop;
+
+            public void Execute()
+            {
+                // Calculate Doppler shift and check if it's within the specified range
+                float dopplerValue = Vector3.Dot(otherRBVel - thisRBVel, thisPos.DirTo(otherPos));
+
+                if (!dopplerValue.InRange(minDop, maxDop))
+                {
+                    // Store the Doppler shift value in the result array
+                    result[0] = dopplerValue;
+                }
+                else
+                {
+                    // If the Doppler shift is not within the range, store a default value
+                    result[0] = float.MaxValue;
+                }
+            }
+        }
+
+        public static float DopplerValue(Rigidbody thisThing, Rigidbody otherThing, float minDop, float maxDop)
+            {
+                NativeArray<float> result = new NativeArray<float>(64, Allocator.TempJob);
+                Vector3 thisVel = thisThing.velocity;
+                Vector3 otherVel = otherThing.velocity;
+                Vector3 thisPos = thisThing.transform.position;
+                Vector3 otherPos = otherThing.transform.position;
+
+                DopplerJob dopplerJob = new DopplerJob
+                {
+                    thisRBVel = thisVel,
+                    otherRBVel = otherVel,
+                    thisPos = thisPos,
+                    otherPos = otherPos,
+                    result = result
+                };
+
+                JobHandle handle = dopplerJob.Schedule();
+                handle.Complete();
+
+                float dopplerValue = result[0];
+
+                result.Dispose();
+
+                return dopplerValue;
+            }
 
         /// <summary>
-        /// Summarizes and filters based on the heading and bearing of the targets in relation to the original rigidbody.
-        /// Sorted by what targets are currently moving towards the calling rigidbody.
+        /// Gets whatever is bearing down most aggressively towards the current transform
         /// </summary>
         /// <param name="rList"></param>
         /// <param name="thisRB"></param>
         /// <param name="dMin"></param>
         /// <param name="dMax"></param>
         /// <returns></returns>
-        public static List<RadReturn> HeadingFilter(this List<RadReturn> rList, Transform thisRB)
+        public static T BearingDownOnThis<T,O>(this O thisRB, List<T> rList) where T : MonoPlus where O : Component
         {
-            Dictionary<RadReturn, float> rigidBodies = new Dictionary<RadReturn, float>();
+            float minVal = 0f;
+            T t = null;
 
-            foreach (RadReturn RR in rList)
+            foreach (T RR in rList)
             {
-                if (RR.TryGetComponent<Rigidbody>(out Rigidbody otherRB))
+                // Add the radiation returns alongside the angle between their bearing and the original transform.
+                float f = RR.transform.position.DirTo(thisRB.transform.position).AngleTo(RR.rigidBody.velocity);
+
+                if (f < minVal)
                 {
-                    // Add the radiation returns alongside the angle between their bearing and the original transform.
-                    rigidBodies.Add(RR, RR.transform.position.DirTo(thisRB.transform.position).AngleTo(otherRB.velocity));
+                    minVal = f;
+                    t = RR;
                 }
             }
 
-            // Return the keys in the sorted dictionary as a list, from the least to the greatest.
-            return rigidBodies.OrderBy(kv => kv.Value).ToDictionary(pair => pair.Key, pair => pair.Value).Keys.ToList();
+            //Get whatever object is currently heading towards this point in space more than all others.
+            return t;
+        }
+        public struct AngleCalculationJob : IJobParallelFor
+        {
+            [ReadOnly] public NativeArray<Vector3> velocities;
+            [ReadOnly] public NativeArray<Vector3> positions;
+            public NativeArray<float> angles;
+            public Vector3 point;
+
+            public void Execute(int index)
+            {
+                angles[index] = positions[index].DirTo(point).AngleTo(velocities[index]);
+            }
         }
 
-        public static List<Rigidbody> HeadingFilter(this List<Rigidbody> rList, Transform thisRB)
+        public static List<T> SortByBearing<T>(this List<T> components, Vector3 point) where T : MonoPlus
         {
-            Dictionary<Rigidbody, float> rigidBodies = new Dictionary<Rigidbody, float>();
+            int count = components.Count;
+            if (count == 0) return components;
 
-            foreach (Rigidbody RR in rList)
+            NativeArray<Vector3> velocities = new NativeArray<Vector3>(count, Allocator.TempJob);
+            NativeArray<Vector3> positions = new NativeArray<Vector3>(count, Allocator.TempJob);
+            NativeArray<float> angles = new NativeArray<float>(count, Allocator.TempJob);
+
+            // Copy positions and velocities to their respective NativeArrays
+            for (int i = 0; i < count; i++)
             {
-                // Add the radiation returns alongside the angle between their bearing and the original transform.
-                rigidBodies.Add(RR, RR.transform.position.DirTo(thisRB.transform.position).AngleTo(RR.velocity));
+                Rigidbody otherRB = components[i].rigidBody;
+
+                if (otherRB)
+                {
+                    velocities[i] = otherRB.velocity.normalized;
+                    positions[i] = components[i].transform.position;
+                }
             }
 
-            // Return the keys in the sorted dictionary as a list, from the least to the greatest.
-            return rigidBodies.OrderBy(kv => kv.Value).ToDictionary(pair => pair.Key, pair => pair.Value).Keys.ToList();
+            // Schedule job to compute distances in parallel
+            AngleCalculationJob job = new AngleCalculationJob
+            {
+                velocities = velocities,
+                positions = positions,
+                point = point,
+                angles = angles
+            };
+            JobHandle handle = job.Schedule(count, 64);
+
+            // Wait for job to complete
+            handle.Complete();
+
+            // Create a copy of the original list
+            List<T> sortedComponents = new List<T>(components);
+
+            sortedComponents.ToArray().SortAsync(angles.ToArray());
+
+            // Cleanup
+            velocities.Dispose();
+            positions.Dispose();
+            angles.Dispose();
+
+            return sortedComponents;
         }
 
         public static void PlaySoundAtPoint(this MonoBehaviour MB, Vector3 point, AudioClip A, float volume)
@@ -1036,30 +1489,52 @@ namespace Tallow
     public static class AirWorks
     {
         // Constants for ISA model
-        private const float R = 287.058f; // Specific gas constant for dry air (J/kg·K)
+        private const float R = 287.058f; // Specific gas constant for dry air (J/kgï¿½K)
         private const float T0 = 288.15f; // Standard temperature at sea level (K)
         private const float p0 = 101325f; // Standard pressure at sea level (Pa)
 
-        public static float AirDensity(this Transform t)
+        public struct AirDensityJob : IJob
         {
-            //Get the altitude of the transform.
-            float altitude = t.Altitude();
+            public float T0;
+            public float p0;
+            public float R;
+            public float altitude;
+            public NativeArray<float> densities;
 
-            // Calculate temperature at altitude (ISA model)
-            float T = T0 - 0.0065f * altitude; // lapse rate -6.5°C/km (Kelvin)
+            public void Execute()
+            {
+                float T = T0 - 0.0065f * altitude; // lapse rate -6.5ï¿½C/km (Kelvin)
+                float p = p0 * Mathf.Pow((1f - 0.0065f / T0 * altitude / 288.15f), 5.2561f); // (Pascal)
+                float rho = p / (R * T); // (kg/m^3)
 
-            // Calculate pressure at altitude (ISA model)
-            float p = p0 * Mathf.Pow((1f - 0.0065f / T0 * altitude / 288.15f), 5.2561f); // (Pascal)
+                densities[0] = rho;
+            }
+        }
+        public static float AirDensity(this Transform transform)
+        {
+            NativeArray<float> densities = new NativeArray<float>(1, Allocator.TempJob);
 
-            // Calculate air density using the ideal gas law (Pascal)
-            float rho = p / (R * T); // (kg/m^3)
+            AirDensityJob job = new AirDensityJob
+            {
+                T0 = T0,
+                p0 = p0,
+                R = R,
+                altitude = transform.Altitude(),
+                densities = densities
+            };
 
-            return rho;
+            JobHandle jobHandle = job.Schedule();
+            jobHandle.Complete();
+
+            float density = densities[0];
+            densities.Dispose();
+
+            return density;
         }
 
         public static float Altitude(this Transform t)
         {
-            return t.position.x;
+            return t.position.y;
         }
 
         public static float DragCalc(this Rigidbody rb, float dragCoefficient, float referenceArea)
@@ -1068,7 +1543,7 @@ namespace Tallow
             float airDensity = rb.transform.AirDensity();
 
             // Calculate the angle between the forward direction and the velocity vector
-            float angleVelFwrd = Vector3.Angle(rb.transform.forward, rb.velocity.normalized);
+            float angleVelFwrd = rb.transform.forward.AngleTo(rb.velocity.normalized);
 
             // Calculate drag based on the angle (assuming linear relationship)
             float drag = Mathf.Abs(angleVelFwrd - 90f) / 90f;
@@ -1081,8 +1556,88 @@ namespace Tallow
     }
     public static class PhysWorks
         {
-            // Calculate the minimum distance between two lines using Rigidbody velocity vectors
-            public static bool DistancePassTest(Rigidbody rb1, Rigidbody rb2, float minDist)
+        // Job to calculate minimum distance between two lines
+        struct MinDistBetweenLinesJob : IJob
+        {
+            public Vector3 line1Start;
+            public Vector3 line1End;
+            public Vector3 line2Start;
+            public Vector3 line2End;
+            public NativeArray<float> result;
+
+            public void Execute()
+            {
+                Vector3 closestPointOnLine1;
+                Vector3 closestPointOnLine2;
+
+                // Direction vectors of the lines
+                Vector3 line1Direction = line1End - line1Start;
+                Vector3 line2Direction = line2End - line2Start;
+
+                // Vectors between the start points of the lines
+                Vector3 start1ToStart2 = line2Start - line1Start;
+
+                // Calculate parameters to represent the lines in terms of t (line parameter)
+                float a = Vector3.Dot(line1Direction, line1Direction);
+                float b = Vector3.Dot(line1Direction, line2Direction);
+                float c = Vector3.Dot(line2Direction, line2Direction);
+                float d = Vector3.Dot(line1Direction, start1ToStart2);
+                float e = Vector3.Dot(line2Direction, start1ToStart2);
+
+                // Calculate the parameter values for the closest points on each line
+                float denom = a * c - b * b;
+                float t1 = Mathf.Clamp01((b * e - c * d) / denom);
+                float t2 = Mathf.Clamp01((a * e - b * d) / denom);
+
+                // Calculate the closest points on each line using the parameter values
+                closestPointOnLine1 = line1Start + t1 * line1Direction;
+                closestPointOnLine2 = line2Start + t2 * line2Direction;
+
+                // Store the distance between the closest points
+                result[0] = closestPointOnLine1.DistTo(closestPointOnLine2);
+            }
+        }
+
+        // Calculate the minimum distance between two lines using Unity Jobs
+        public static bool DistancePassTest(Rigidbody rb1, Rigidbody rb2, float minDist)
+        {
+            // Get the start and end points of the lines using Rigidbody positions
+            Vector3 line1Start = rb1.position;
+            Vector3 line1End = rb1.position + rb1.velocity;
+            Vector3 line2Start = rb2.position;
+            Vector3 line2End = rb2.position + rb2.velocity;
+
+            // Create NativeArray to store result
+            NativeArray<float> result = new NativeArray<float>(1, Allocator.TempJob);
+
+            // Create job instance
+            MinDistBetweenLinesJob job = new MinDistBetweenLinesJob()
+            {
+                line1Start = line1Start,
+                line1End = line1End,
+                line2Start = line2Start,
+                line2End = line2End,
+                result = result
+            };
+
+            // Schedule the job
+            JobHandle handle = job.Schedule();
+
+            // Wait for the job to complete
+            handle.Complete();
+
+            // Get the result from the NativeArray
+            float distance = result[0];
+
+            // Dispose the NativeArray
+            result.Dispose();
+
+            // Is the minimum distance between the velocities of the rigidbodies less than the minimum distance specified?
+            return distance < minDist;
+        }
+        /*
+        // Calculate the minimum distance between two lines using Rigidbody velocity vectors
+        public static bool DistancePassTest(Rigidbody rb1, Rigidbody rb2, float minDist)
             {
                 // Get the start and end points of the lines using Rigidbody positions
                 Vector3 line1Start = rb1.position;
@@ -1126,7 +1681,8 @@ namespace Tallow
                 // Calculate and return the distance between the closest points
                 return Vector3.Distance(closestPointOnLine1, closestPointOnLine2);
             }
-        }
+        */
+    }
 
     public class MR : MonoBehaviour
     {
